@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import SwiftUI
+import zlib
 
 class RecipeStore: ObservableObject {
     @Published var recipes: [Recipe] = []
@@ -200,10 +201,7 @@ class RecipeStore: ObservableObject {
                 if compression == 0 {
                     rawData = entryData
                 } else if compression == 8 {
-                    // Deflate: prepend zlib header (0x78 0x9C) so NSData can decompress
-                    var wrapped = Data([0x78, 0x9C])
-                    wrapped.append(entryData)
-                    rawData = (try? (wrapped as NSData).decompressed(using: .zlib) as Data) ?? entryData
+                    rawData = Self.inflateRaw(entryData) ?? entryData
                 } else {
                     rawData = entryData
                 }
@@ -234,6 +232,39 @@ class RecipeStore: ObservableObject {
         let mostCooked = recipes.filter { !$0.cooks.isEmpty }.map { (recipe: $0, count: $0.cooks.count) }.sorted { $0.count > $1.count }.prefix(5).map { $0 }
         let recentCooks = recipes.flatMap { r in r.cooks.map { (recipe: r, entry: $0) } }.sorted { $0.entry.date > $1.entry.date }.prefix(10).map { $0 }
         return AppStats(totalRecipes: recipes.count, totalCooks: totalCooks, averageRating: avgRating, mostCooked: mostCooked, recentCooks: recentCooks)
+    }
+}
+
+// MARK: - Raw deflate decompression (ZIP compression method 8)
+
+private extension RecipeStore {
+    /// Decompresses raw DEFLATE data (RFC 1951) as stored in ZIP files.
+    /// `NSData.decompressed(using: .zlib)` requires RFC 1950 (header + Adler-32 trailer)
+    /// and silently fails on raw deflate, so we use zlib's inflateInit2 with a negative
+    /// window size to enable raw inflate mode.
+    static func inflateRaw(_ data: Data) -> Data? {
+        guard !data.isEmpty else { return nil }
+        return data.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Data? in
+            guard let srcBase = src.baseAddress else { return nil }
+            var stream = z_stream()
+            stream.next_in = UnsafeMutablePointer(mutating: srcBase.assumingMemoryBound(to: Bytef.self))
+            stream.avail_in = uInt(data.count)
+            guard inflateInit2_(&stream, -MAX_WBITS, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else { return nil }
+            defer { inflateEnd(&stream) }
+            var result = Data()
+            var buf = [UInt8](repeating: 0, count: 65536)
+            var status: Int32 = Z_OK
+            repeat {
+                let written = buf.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) -> Int in
+                    stream.next_out = dst.bindMemory(to: Bytef.self).baseAddress
+                    stream.avail_out = uInt(dst.count)
+                    status = inflate(&stream, Z_SYNC_FLUSH)
+                    return dst.count - Int(stream.avail_out)
+                }
+                if written > 0 { result.append(contentsOf: buf.prefix(written)) }
+            } while status == Z_OK
+            return status == Z_STREAM_END ? result : nil
+        }
     }
 }
 
