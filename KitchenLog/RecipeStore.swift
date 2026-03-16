@@ -24,7 +24,7 @@ class RecipeStore: ObservableObject {
 
     private var localFileURL: URL {
         FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(fileName)
     }
 
