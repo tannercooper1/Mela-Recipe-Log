@@ -16,6 +16,7 @@
 		A007 /* LogCookView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B007 /* LogCookView.swift */; };
 		A008 /* AddRecipeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B008 /* AddRecipeView.swift */; };
 		A009 /* StatsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B009 /* StatsView.swift */; };
+		A010 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B010 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -28,6 +29,7 @@
 		B007 /* LogCookView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogCookView.swift; sourceTree = "<group>"; };
 		B008 /* AddRecipeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddRecipeView.swift; sourceTree = "<group>"; };
 		B009 /* StatsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatsView.swift; sourceTree = "<group>"; };
+		B010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		C001 /* KitchenLog.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KitchenLog.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -61,6 +63,7 @@
 				B007 /* LogCookView.swift */,
 				B008 /* AddRecipeView.swift */,
 				B009 /* StatsView.swift */,
+				B010 /* Assets.xcassets */,
 			);
 			path = KitchenLog;
 			sourceTree = "<group>";
@@ -123,7 +126,9 @@
 		H002 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
-			files = ();
+			files = (
+				A010 /* Assets.xcassets in Resources */,
+			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
