@@ -136,12 +136,20 @@ class RecipeStore: ObservableObject {
         // Parse zip off the main actor
         let melasToImport: [MelaRecipe] = try await Task.detached(priority: .userInitiated) { [weak self] in
             guard self != nil else { return [] }
+            print("[MelaImport] URL: \(url)")
+            print("[MelaImport] ext: '\(ext)'")
+            print("[MelaImport] fileExists: \(FileManager.default.fileExists(atPath: url.path))")
             if ext == "melarecipes" || ext == "zip" {
-                return (try? RecipeStore.parseZipData(contentsOf: url)) ?? []
+                return try RecipeStore.parseZipData(contentsOf: url)
             } else if ext == "melarecipe" {
                 let data = try Data(contentsOf: url)
-                return (try? JSONDecoder().decode(MelaRecipe.self, from: data)).map { [$0] } ?? []
+                guard let recipe = try? JSONDecoder().decode(MelaRecipe.self, from: data) else {
+                    print("[MelaImport] JSON decode failed for single .melarecipe")
+                    return []
+                }
+                return [recipe]
             }
+            print("[MelaImport] Unrecognized extension: '\(ext)'")
             return []
         }.value
 
@@ -170,44 +178,87 @@ class RecipeStore: ObservableObject {
     /// Handles stored (compression=0) and deflated (compression=8) entries.
     private static func parseZipData(contentsOf url: URL) throws -> [MelaRecipe] {
         let data = try Data(contentsOf: url)
+        print("[MelaImport] ZIP data size: \(data.count) bytes")
+        guard data.count >= 4,
+              data[0] == 0x50, data[1] == 0x4B else {
+            print("[MelaImport] Not a ZIP file (bad magic bytes: \(data.prefix(4).map { String(format: "%02X", $0) }.joined()))")
+            return []
+        }
+
         var melas: [MelaRecipe] = []
         var offset = 0
+        var entryCount = 0
 
         while offset + 30 <= data.count {
             // Local file header: PK\x03\x04
             guard data[offset]   == 0x50, data[offset+1] == 0x4B,
                   data[offset+2] == 0x03, data[offset+3] == 0x04 else { break }
 
+            let flags          = data.u16(at: offset + 6)
             let compression    = data.u16(at: offset + 8)
-            let compressedSize = Int(data.u32(at: offset + 18))
-            _ = Int(data.u32(at: offset + 22))
+            var compressedSize = Int(data.u32(at: offset + 18))
             let nameLen        = Int(data.u16(at: offset + 26))
             let extraLen       = Int(data.u16(at: offset + 28))
 
-            let nameStart  = offset + 30
-            let nameEnd    = nameStart + nameLen
-            let dataStart  = nameEnd + extraLen
-            let dataEnd    = dataStart + compressedSize
+            let nameStart = offset + 30
+            let nameEnd   = nameStart + nameLen
+            let dataStart = nameEnd + extraLen
 
-            guard nameEnd  <= data.count,
-                  dataEnd  <= data.count else { break }
+            guard nameEnd <= data.count else { break }
 
             let name = String(bytes: data[nameStart..<nameEnd], encoding: .utf8) ?? ""
+            entryCount += 1
+            print("[MelaImport] Entry \(entryCount): '\(name)' compression=\(compression) compressedSize=\(compressedSize) flags=\(flags)")
 
-            if name.hasSuffix(".melarecipe"), compressedSize > 0 {
+            // If bit 3 is set, sizes are in a data descriptor after the data.
+            // We must scan for the next PK\x03\x04 or PK\x01\x02 to find the boundary.
+            if (flags & 0x08) != 0 && compressedSize == 0 {
+                print("[MelaImport]   -> data descriptor entry, scanning for boundary")
+                var scanOffset = dataStart
+                while scanOffset + 4 <= data.count {
+                    if data[scanOffset] == 0x50 && data[scanOffset+1] == 0x4B &&
+                       (data[scanOffset+2] == 0x03 || data[scanOffset+2] == 0x01) &&
+                       (data[scanOffset+3] == 0x04 || data[scanOffset+3] == 0x02) {
+                        compressedSize = scanOffset - dataStart
+                        break
+                    }
+                    if data[scanOffset] == 0x50 && data[scanOffset+1] == 0x4B &&
+                       data[scanOffset+2] == 0x07 && data[scanOffset+3] == 0x08 {
+                        compressedSize = scanOffset - dataStart
+                        break
+                    }
+                    scanOffset += 1
+                }
+                print("[MelaImport]   -> resolved compressedSize=\(compressedSize)")
+            }
+
+            let dataEnd = dataStart + compressedSize
+            guard dataEnd <= data.count else { break }
+
+            if name.lowercased().hasSuffix(".melarecipe"), compressedSize > 0 {
                 let entryData = Data(data[dataStart..<dataEnd])
                 let rawData: Data
 
                 if compression == 0 {
                     rawData = entryData
                 } else if compression == 8 {
-                    rawData = Self.inflateRaw(entryData) ?? entryData
+                    if let inflated = Self.inflateRaw(entryData) {
+                        rawData = inflated
+                    } else {
+                        print("[MelaImport]   -> inflateRaw failed for '\(name)'")
+                        rawData = entryData
+                    }
                 } else {
+                    print("[MelaImport]   -> unknown compression \(compression) for '\(name)'")
                     rawData = entryData
                 }
 
                 if let recipe = try? JSONDecoder().decode(MelaRecipe.self, from: rawData) {
+                    print("[MelaImport]   -> decoded recipe: '\(recipe.title)'")
                     melas.append(recipe)
+                } else {
+                    let preview = String(data: rawData.prefix(200), encoding: .utf8) ?? "<non-UTF8>"
+                    print("[MelaImport]   -> JSON decode failed for '\(name)'. Data preview: \(preview)")
                 }
             }
 
@@ -220,6 +271,7 @@ class RecipeStore: ObservableObject {
             }
         }
 
+        print("[MelaImport] Total entries: \(entryCount), decoded: \(melas.count)")
         return melas
     }
 
