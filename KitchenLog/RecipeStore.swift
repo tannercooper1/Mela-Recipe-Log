@@ -174,101 +174,135 @@ class RecipeStore: ObservableObject {
         return (imported, skipped)
     }
 
-    /// Pure Swift ZIP parser — no Process, works on iOS, iPadOS and Mac Catalyst.
-    /// Handles stored (compression=0) and deflated (compression=8) entries.
+    /// ZIP64-aware parser using the central directory — the correct way to navigate
+    /// large ZIP files where local headers may have 0xFFFFFFFF placeholder sizes.
     private static func parseZipData(contentsOf url: URL) throws -> [MelaRecipe] {
         let data = try Data(contentsOf: url)
         print("[MelaImport] ZIP data size: \(data.count) bytes")
-        guard data.count >= 4,
+        guard data.count >= 22,
               data[0] == 0x50, data[1] == 0x4B else {
-            print("[MelaImport] Not a ZIP file (bad magic bytes: \(data.prefix(4).map { String(format: "%02X", $0) }.joined()))")
+            print("[MelaImport] Not a ZIP (bad magic)")
             return []
         }
 
+        // --- Locate End of Central Directory (EOCD) ---
+        // Search backward for PK\x05\x06, allowing for an optional comment.
+        var eocd = -1
+        let searchFrom = max(0, data.count - 65558)
+        for i in stride(from: data.count - 22, through: searchFrom, by: -1) {
+            guard data[i] == 0x50, data[i+1] == 0x4B,
+                  data[i+2] == 0x05, data[i+3] == 0x06 else { continue }
+            let commentLen = Int(data.u16(at: i + 20))
+            if i + 22 + commentLen == data.count { eocd = i; break }
+        }
+        guard eocd >= 0 else {
+            print("[MelaImport] EOCD not found")
+            return []
+        }
+
+        var cdOffset = Int(data.u32(at: eocd + 16))
+        var cdSize   = Int(data.u32(at: eocd + 12))
+
+        // Check for ZIP64 EOCD locator (PK\x06\x07) immediately before the EOCD.
+        if eocd >= 20 {
+            let loc = eocd - 20
+            if data[loc] == 0x50, data[loc+1] == 0x4B,
+               data[loc+2] == 0x06, data[loc+3] == 0x07 {
+                let z64Off = Int(truncatingIfNeeded: data.u64(at: loc + 8))
+                if z64Off + 56 <= data.count,
+                   data[z64Off] == 0x50, data[z64Off+1] == 0x4B,
+                   data[z64Off+2] == 0x06, data[z64Off+3] == 0x06 {
+                    cdSize   = Int(truncatingIfNeeded: data.u64(at: z64Off + 40))
+                    cdOffset = Int(truncatingIfNeeded: data.u64(at: z64Off + 48))
+                    print("[MelaImport] ZIP64 central directory: offset=\(cdOffset) size=\(cdSize)")
+                }
+            }
+        }
+
+        guard cdOffset >= 0, cdOffset + cdSize <= data.count else {
+            print("[MelaImport] Central directory out of bounds")
+            return []
+        }
+
+        // --- Parse Central Directory ---
         var melas: [MelaRecipe] = []
-        var offset = 0
+        var pos = cdOffset
         var entryCount = 0
 
-        while offset + 30 <= data.count {
-            // Local file header: PK\x03\x04
-            guard data[offset]   == 0x50, data[offset+1] == 0x4B,
-                  data[offset+2] == 0x03, data[offset+3] == 0x04 else { break }
+        while pos + 46 <= cdOffset + cdSize {
+            guard data[pos] == 0x50, data[pos+1] == 0x4B,
+                  data[pos+2] == 0x01, data[pos+3] == 0x02 else { break }
 
-            let flags          = data.u16(at: offset + 6)
-            let compression    = data.u16(at: offset + 8)
-            var compressedSize = Int(data.u32(at: offset + 18))
-            let nameLen        = Int(data.u16(at: offset + 26))
-            let extraLen       = Int(data.u16(at: offset + 28))
+            let compression      = data.u16(at: pos + 10)
+            var compressedSize   = Int(data.u32(at: pos + 20))
+            var uncompressedSize = Int(data.u32(at: pos + 24))
+            var localOffset      = Int(data.u32(at: pos + 42))
+            let nameLen          = Int(data.u16(at: pos + 28))
+            let extraLen         = Int(data.u16(at: pos + 30))
+            let commentLen       = Int(data.u16(at: pos + 32))
+            let entrySize        = 46 + nameLen + extraLen + commentLen
 
-            let nameStart = offset + 30
-            let nameEnd   = nameStart + nameLen
-            let dataStart = nameEnd + extraLen
-
-            guard nameEnd <= data.count else { break }
-
-            let name = String(bytes: data[nameStart..<nameEnd], encoding: .utf8) ?? ""
+            let nameStart  = pos + 46
+            guard nameStart + nameLen <= data.count else { break }
+            let name = String(bytes: data[nameStart..<(nameStart + nameLen)], encoding: .utf8) ?? ""
             entryCount += 1
-            print("[MelaImport] Entry \(entryCount): '\(name)' compression=\(compression) compressedSize=\(compressedSize) flags=\(flags)")
 
-            // If bit 3 is set, sizes are in a data descriptor after the data.
-            // We must scan for the next PK\x03\x04 or PK\x01\x02 to find the boundary.
-            if (flags & 0x08) != 0 && compressedSize == 0 {
-                print("[MelaImport]   -> data descriptor entry, scanning for boundary")
-                var scanOffset = dataStart
-                while scanOffset + 4 <= data.count {
-                    if data[scanOffset] == 0x50 && data[scanOffset+1] == 0x4B &&
-                       (data[scanOffset+2] == 0x03 || data[scanOffset+2] == 0x01) &&
-                       (data[scanOffset+3] == 0x04 || data[scanOffset+3] == 0x02) {
-                        compressedSize = scanOffset - dataStart
+            // Parse ZIP64 extra field if any size/offset field is 0xFFFFFFFF.
+            if compressedSize == Int(UInt32.max) || uncompressedSize == Int(UInt32.max) || localOffset == Int(UInt32.max) {
+                let extraStart = nameStart + nameLen
+                let extraEnd   = min(extraStart + extraLen, data.count)
+                var ep = extraStart
+                while ep + 4 <= extraEnd {
+                    let eid = data.u16(at: ep)
+                    let esz = Int(data.u16(at: ep + 2))
+                    if eid == 0x0001 {
+                        var fp = ep + 4
+                        if uncompressedSize == Int(UInt32.max), fp + 8 <= ep + 4 + esz {
+                            uncompressedSize = Int(truncatingIfNeeded: data.u64(at: fp)); fp += 8
+                        }
+                        if compressedSize == Int(UInt32.max), fp + 8 <= ep + 4 + esz {
+                            compressedSize = Int(truncatingIfNeeded: data.u64(at: fp)); fp += 8
+                        }
+                        if localOffset == Int(UInt32.max), fp + 8 <= ep + 4 + esz {
+                            localOffset = Int(truncatingIfNeeded: data.u64(at: fp))
+                        }
                         break
                     }
-                    if data[scanOffset] == 0x50 && data[scanOffset+1] == 0x4B &&
-                       data[scanOffset+2] == 0x07 && data[scanOffset+3] == 0x08 {
-                        compressedSize = scanOffset - dataStart
-                        break
-                    }
-                    scanOffset += 1
+                    ep += 4 + esz
                 }
-                print("[MelaImport]   -> resolved compressedSize=\(compressedSize)")
             }
 
-            let dataEnd = dataStart + compressedSize
-            guard dataEnd <= data.count else { break }
-
             if name.lowercased().hasSuffix(".melarecipe"), compressedSize > 0 {
+                print("[MelaImport] Entry \(entryCount): '\(name)' compression=\(compression) size=\(compressedSize)")
+                guard localOffset + 30 <= data.count else {
+                    print("[MelaImport]   -> local header OOB"); pos += entrySize; continue
+                }
+                let localNameLen  = Int(data.u16(at: localOffset + 26))
+                let localExtraLen = Int(data.u16(at: localOffset + 28))
+                let dataStart = localOffset + 30 + localNameLen + localExtraLen
+                let dataEnd   = dataStart + compressedSize
+                guard dataEnd <= data.count else {
+                    print("[MelaImport]   -> data OOB"); pos += entrySize; continue
+                }
+
                 let entryData = Data(data[dataStart..<dataEnd])
                 let rawData: Data
-
-                if compression == 0 {
-                    rawData = entryData
-                } else if compression == 8 {
-                    if let inflated = Self.inflateRaw(entryData) {
-                        rawData = inflated
-                    } else {
-                        print("[MelaImport]   -> inflateRaw failed for '\(name)'")
-                        rawData = entryData
-                    }
+                if compression == 8 {
+                    rawData = Self.inflateRaw(entryData) ?? entryData
                 } else {
-                    print("[MelaImport]   -> unknown compression \(compression) for '\(name)'")
                     rawData = entryData
                 }
 
                 if let recipe = try? JSONDecoder().decode(MelaRecipe.self, from: rawData) {
-                    print("[MelaImport]   -> decoded recipe: '\(recipe.title)'")
+                    print("[MelaImport]   -> decoded: '\(recipe.title)'")
                     melas.append(recipe)
                 } else {
                     let preview = String(data: rawData.prefix(200), encoding: .utf8) ?? "<non-UTF8>"
-                    print("[MelaImport]   -> JSON decode failed for '\(name)'. Data preview: \(preview)")
+                    print("[MelaImport]   -> JSON FAILED. Preview: \(preview)")
                 }
             }
 
-            offset = dataEnd
-            // Skip optional data descriptor (PK\x07\x08)
-            if offset + 4 <= data.count,
-               data[offset] == 0x50, data[offset+1] == 0x4B,
-               data[offset+2] == 0x07, data[offset+3] == 0x08 {
-                offset += 16
-            }
+            pos += entrySize
         }
 
         print("[MelaImport] Total entries: \(entryCount), decoded: \(melas.count)")
@@ -329,5 +363,8 @@ private extension Data {
     func u32(at offset: Int) -> UInt32 {
         UInt32(self[offset]) | (UInt32(self[offset+1]) << 8) |
         (UInt32(self[offset+2]) << 16) | (UInt32(self[offset+3]) << 24)
+    }
+    func u64(at offset: Int) -> UInt64 {
+        UInt64(u32(at: offset)) | (UInt64(u32(at: offset + 4)) << 32)
     }
 }
