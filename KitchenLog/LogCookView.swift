@@ -58,7 +58,7 @@ struct InteractiveStarRating: View {
             ForEach(1...5, id: \.self) { i in
                 Image(systemName: i <= rating ? "star.fill" : "star")
                     .font(.title2)
-                    .foregroundStyle(i <= rating ? .yellow : .tertiary)
+                    .foregroundStyle(i <= rating ? Color.yellow : Color(.tertiaryLabel))
                     .onTapGesture {
                         if rating == i {
                             rating = 0  // tap same star to clear

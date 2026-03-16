@@ -112,6 +112,6 @@ struct StatCard: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
-        .background(.secondarySystemGroupedBackground, in: RoundedRectangle(cornerRadius: 10))
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10))
     }
 }
