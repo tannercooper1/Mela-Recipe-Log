@@ -179,7 +179,7 @@ class RecipeStore: ObservableObject {
 
             let compression    = data.u16(at: offset + 8)
             let compressedSize = Int(data.u32(at: offset + 18))
-            let uncompSize     = Int(data.u32(at: offset + 22))
+            _ = Int(data.u32(at: offset + 22))
             let nameLen        = Int(data.u16(at: offset + 26))
             let extraLen       = Int(data.u16(at: offset + 28))
 
