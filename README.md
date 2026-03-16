@@ -27,16 +27,7 @@ Double-click `KitchenLog.xcodeproj` to open it in Xcode.
 - Under **Team**, select your personal Apple ID
 - Xcode will automatically manage signing
 
-### 3. Enable iCloud (for cross-device sync)
-
-Still in **Signing & Capabilities**:
-- Click **+ Capability**
-- Add **iCloud**
-- Under iCloud, tick **Key-value storage**
-
-This lets your cook log and recipe data sync silently across all your devices.
-
-### 4. Set your Bundle Identifier
+### 3. Set your Bundle Identifier
 
 Change `com.kitchenlog.app` to something unique, e.g. `com.yourname.kitchenlog`.
 Do this in **Build Settings → Product Bundle Identifier**.
@@ -86,10 +77,13 @@ The Stats tab shows total recipes, total cooks, average rating, most-cooked reci
 
 ## Data storage
 
-All data is stored in `NSUbiquitousKeyValueStore` (iCloud key-value store), which:
-- Syncs automatically across all devices signed into the same Apple ID
-- Works offline and syncs when connectivity is restored
-- Requires no iCloud Drive folder or manual sync
+All data is stored as a single JSON file — `KitchenLog.json` — in your iCloud Drive app container. This means:
+- It syncs automatically across all devices signed into the same Apple ID
+- It works offline and syncs when connectivity is restored
+- No paid Apple Developer account is required
+- You can even view or back up the raw file in Files.app under **iCloud Drive → KitchenLog**
+
+If iCloud is not available (e.g. signed out), the app falls back to a local file in Application Support so you never lose data.
 
 ---
 
