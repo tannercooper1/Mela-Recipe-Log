@@ -125,67 +125,104 @@ class RecipeStore: ObservableObject {
     // MARK: - Mela import
 
     @discardableResult
+    @MainActor
     func importMelaFile(url: URL) async throws -> (imported: Int, skipped: Int) {
         let accessing = url.startAccessingSecurityScopedResource()
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
 
         let ext = url.pathExtension.lowercased()
-        var melasToImport: [MelaRecipe] = []
 
-        if ext == "melarecipes" || ext == "zip" {
-            melasToImport = try parseMelaRecipesZip(url: url)
-        } else if ext == "melarecipe" {
-            if let recipe = try? parseSingleMelaRecipe(url: url) {
-                melasToImport = [recipe]
+        // Parse zip off the main actor
+        let melasToImport: [MelaRecipe] = try await Task.detached(priority: .userInitiated) { [weak self] in
+            guard self != nil else { return [] }
+            if ext == "melarecipes" || ext == "zip" {
+                return (try? RecipeStore.parseZipData(contentsOf: url)) ?? []
+            } else if ext == "melarecipe" {
+                let data = try Data(contentsOf: url)
+                return (try? JSONDecoder().decode(MelaRecipe.self, from: data)).map { [$0] } ?? []
             }
-        }
+            return []
+        }.value
 
         var imported = 0
         var skipped = 0
 
-        await MainActor.run {
-            for mela in melasToImport {
-                let isDuplicate = recipes.contains {
-                    ($0.melaID != nil && $0.melaID == mela.id) ||
-                    $0.name.lowercased() == mela.title.lowercased()
-                }
-                if isDuplicate { skipped += 1 } else { recipes.append(Recipe(from: mela)); imported += 1 }
+        for mela in melasToImport {
+            let isDuplicate = recipes.contains {
+                ($0.melaID != nil && $0.melaID == mela.id) ||
+                $0.name.lowercased() == mela.title.lowercased()
             }
-            if imported > 0 { save() }
-            syncMessage = "\(imported) imported, \(skipped) already in log"
+            if isDuplicate {
+                skipped += 1
+            } else {
+                recipes.append(Recipe(from: mela))
+                imported += 1
+            }
         }
+
+        if imported > 0 { save() }
+        syncMessage = "\(imported) imported, \(skipped) already in log"
         return (imported, skipped)
     }
 
-    private func parseMelaRecipesZip(url: URL) throws -> [MelaRecipe] {
-        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
-
+    /// Pure Swift ZIP parser — no Process, works on iOS, iPadOS and Mac Catalyst.
+    /// Handles stored (compression=0) and deflated (compression=8) entries.
+    private static func parseZipData(contentsOf url: URL) throws -> [MelaRecipe] {
         let data = try Data(contentsOf: url)
-        let zipFile = tmpDir.appendingPathComponent("archive.zip")
-        try data.write(to: zipFile)
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        process.arguments = ["-o", zipFile.path, "-d", tmpDir.path]
-        try process.run()
-        process.waitUntilExit()
-
         var melas: [MelaRecipe] = []
-        let contents = (try? FileManager.default.contentsOfDirectory(at: tmpDir, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? []
-        for fileURL in contents {
-            if fileURL.pathExtension.lowercased() == "melarecipe",
-               let recipe = try? parseSingleMelaRecipe(url: fileURL) {
-                melas.append(recipe)
+        var offset = 0
+
+        while offset + 30 <= data.count {
+            // Local file header: PK\x03\x04
+            guard data[offset]   == 0x50, data[offset+1] == 0x4B,
+                  data[offset+2] == 0x03, data[offset+3] == 0x04 else { break }
+
+            let compression    = data.u16(at: offset + 8)
+            let compressedSize = Int(data.u32(at: offset + 18))
+            let uncompSize     = Int(data.u32(at: offset + 22))
+            let nameLen        = Int(data.u16(at: offset + 26))
+            let extraLen       = Int(data.u16(at: offset + 28))
+
+            let nameStart  = offset + 30
+            let nameEnd    = nameStart + nameLen
+            let dataStart  = nameEnd + extraLen
+            let dataEnd    = dataStart + compressedSize
+
+            guard nameEnd  <= data.count,
+                  dataEnd  <= data.count else { break }
+
+            let name = String(bytes: data[nameStart..<nameEnd], encoding: .utf8) ?? ""
+
+            if name.hasSuffix(".melarecipe"), compressedSize > 0 {
+                let entryData = Data(data[dataStart..<dataEnd])
+                let rawData: Data
+
+                if compression == 0 {
+                    rawData = entryData
+                } else if compression == 8 {
+                    // Deflate: prepend zlib header (0x78 0x9C) so NSData can decompress
+                    var wrapped = Data([0x78, 0x9C])
+                    wrapped.append(entryData)
+                    rawData = (try? (wrapped as NSData).decompressed(using: .zlib) as Data) ?? entryData
+                } else {
+                    rawData = entryData
+                }
+
+                if let recipe = try? JSONDecoder().decode(MelaRecipe.self, from: rawData) {
+                    melas.append(recipe)
+                }
+            }
+
+            offset = dataEnd
+            // Skip optional data descriptor (PK\x07\x08)
+            if offset + 4 <= data.count,
+               data[offset] == 0x50, data[offset+1] == 0x4B,
+               data[offset+2] == 0x07, data[offset+3] == 0x08 {
+                offset += 16
             }
         }
-        return melas
-    }
 
-    private func parseSingleMelaRecipe(url: URL) throws -> MelaRecipe? {
-        let data = try Data(contentsOf: url)
-        return try? JSONDecoder().decode(MelaRecipe.self, from: data)
+        return melas
     }
 
     // MARK: - Stats
@@ -197,5 +234,17 @@ class RecipeStore: ObservableObject {
         let mostCooked = recipes.filter { !$0.cooks.isEmpty }.map { (recipe: $0, count: $0.cooks.count) }.sorted { $0.count > $1.count }.prefix(5).map { $0 }
         let recentCooks = recipes.flatMap { r in r.cooks.map { (recipe: r, entry: $0) } }.sorted { $0.entry.date > $1.entry.date }.prefix(10).map { $0 }
         return AppStats(totalRecipes: recipes.count, totalCooks: totalCooks, averageRating: avgRating, mostCooked: mostCooked, recentCooks: recentCooks)
+    }
+}
+
+// MARK: - Data helpers
+
+private extension Data {
+    func u16(at offset: Int) -> UInt16 {
+        UInt16(self[offset]) | (UInt16(self[offset + 1]) << 8)
+    }
+    func u32(at offset: Int) -> UInt32 {
+        UInt32(self[offset]) | (UInt32(self[offset+1]) << 8) |
+        (UInt32(self[offset+2]) << 16) | (UInt32(self[offset+3]) << 24)
     }
 }
